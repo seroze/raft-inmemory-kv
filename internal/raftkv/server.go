@@ -259,6 +259,10 @@ func (s *Server) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) err
 	return nil
 }
 
+func (s *Server) getLastLogIndex() int {
+	panic("unimplemented")
+}
+
 func (s *Server) getLastLogTerm() int {
 	panic("unimplemented")
 }
