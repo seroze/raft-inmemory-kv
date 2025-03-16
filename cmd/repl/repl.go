@@ -6,14 +6,45 @@ import (
 	"os"
 	"raftkv/internal/raftkv"
 	"strings"
+	"strconv"
 	// "raft-inmemory-kv/internal/raftkv" // Adjust the import path based on your module name
 )
 
 func main() {
-	store := raftkv.NewStore() // Initialize the store
+
+	// Check if an argument was provided
+	if len(os.Args) < 2 {
+		fmt.Println("Usage: go run main.go <server_id>")
+		return
+	}
+
+	// Convert the argument to an integer
+	serverID, err := strconv.Atoi(os.Args[1])
+	if err != nil || serverID < 1 || serverID > 5 {
+		fmt.Println("Error: Server ID must be a number between 1 and 5")
+		return
+	}
+
+	configFile := "servers.config"
+	// fmt.Println(raftkv.TOTAL_SERVERS)
+	serverMap, err := raftkv.LoadServerConfig(configFile)
+	if err != nil {
+		fmt.Println("Error loading server config:", err)
+		return
+	}
+
+	fmt.Println("Loaded Server Config:", serverMap)
+
+	// store := raftkv.NewStore() // Initialize the store
+	server := raftkv.NewServer(serverID, raftkv.LOCAL_IPADDR, serverMap[serverID]) 
+
+	for id,port := range serverMap{
+		server.AddPeer(raftkv.Peer{ID: id, IpAddr: "127.0.0.1", Port: port})
+	}
+
 	reader := bufio.NewReader(os.Stdin)
 
-	fmt.Println("Welcome to RaftKV REPL")
+	fmt.Println("Welcome to RaftKV REPL server: ", serverID)
 	fmt.Println("Commands: SET <key> <value>, GET <key>, DELETE <key>, EXIT")
 
 	for {
@@ -45,7 +76,7 @@ func main() {
 			}
 			key := parts[1]
 			value := []byte(parts[2])
-			store.Set(key, value)
+			server.Set(key, value)
 			fmt.Println("OK")
 
 		case "GET":
@@ -54,7 +85,7 @@ func main() {
 				continue
 			}
 			key := parts[1]
-			value, err := store.Get(key)
+			value, err := server.Get(key)
 			if err != nil {
 				fmt.Println("Error:", err)
 			} else {
@@ -67,7 +98,7 @@ func main() {
 				continue
 			}
 			key := parts[1]
-			store.Delete(key)
+			server.Delete(key)
 			fmt.Println("Deleted", key)
 
 		case "EXIT":
