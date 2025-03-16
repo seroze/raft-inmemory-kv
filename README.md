@@ -13,6 +13,12 @@ Roadmap:
 - [] Implement leader election
 - [] Testing
 
+Issues:
+
+- replica's are not handling get's, i know set's shouldn't be allowed
+- how to make the rpc framework generic so that it can handle all kinds of RPCs
+- 
+
 Learnings
 
 - In go you can keep main logic in internal directory

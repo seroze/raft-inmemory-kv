@@ -4,10 +4,10 @@ import (
 	"fmt"
 	// "raftkv/internal/raftkv"
 	"encoding/gob"
-	"sync"
-	"time"
 	"net"
 	"strings"
+	"sync"
+	"time"
 )
 
 const (
@@ -16,35 +16,40 @@ const (
 
 // Server represents a node in the Raft cluster
 type Server struct {
-	ID     int             // Unique server ID (1-5)
-	IpAddr string 		   // IpAddress
-	Port   int 			   // port 
-	Logs   *Logs           // Log storage for RAFT replication
-	Store  *Store          // The actual key-value store
-	Peers  []Peer       // List of peer servers
-	mu     sync.Mutex      // Mutex to prevent race conditions
-	leader bool            // If true, this server is the leader
+	ID          int        // Unique server ID (1-5)
+	IpAddr      string     // IpAddress
+	Port        int        // port
+	Logs        *Logs      // Log storage for RAFT replication
+	Store       *Store     // The actual key-value store
+	Peers       []Peer     // List of peer servers
+	currentTerm int        // current term
+	votedFor    int        // id of the server to whom the vote was given in current term
+	commitIndex int        // commit index
+	mu          sync.Mutex // Mutex to prevent race conditions
+	leader      bool       // If true, this server is the leader
 }
 
 type Peer struct {
-	ID int // id of the peer. (1-5)
-	IpAddr string // ip address of peer 
-	Port int // port 
+	ID     int    // id of the peer. (1-5)
+	IpAddr string // ip address of peer
+	Port   int    // port
 }
 
 // NewServer initializes a new Server instance
 func NewServer(id int, ipAddr string, port int) *Server {
 	server := &Server{
-		ID:    id,
-		IpAddr: LOCAL_IPADDR,
-		Port:  port,
-		Store: NewStore(),
-		Logs:  NewLogs(),
-		Peers: []Peer{}, // Empty list, will be populated later
+		ID:          id,
+		IpAddr:      LOCAL_IPADDR,
+		Port:        port,
+		Store:       NewStore(),
+		Logs:        NewLogs(),
+		Peers:       []Peer{}, // Empty list, will be populated later
+		currentTerm: 0,
+		commitIndex: -1,
 	}
 
-	if server.ID==1{
-		//set node 1 as leader 
+	if server.ID == 1 {
+		//set node 1 as leader for now, will remove this once leader election is in place
 		server.SetLeader()
 	}
 
@@ -105,7 +110,6 @@ func (s *Server) handleConnection(conn net.Conn) {
 	fmt.Printf("📩 Server %d received log entry: %+v\n", s.ID, logEntry)
 	s.Logs.AppendLog(logEntry)
 }
-
 
 func (s *Server) ProcessCommand(command string) {
 	s.mu.Lock()
@@ -191,36 +195,73 @@ func (s *Server) AppendEntry(command string) {
 	}
 }
 
-// func (s *Server) AppendEntry(command string) {
-// 	s.mu.Lock()
-// 	defer s.mu.Unlock()
+// AppendEntries handles log replication from the leader
+func (s *Server) AppendEntries(args AppendEntriesArgs, reply AppendEntriesReply) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-// 	// Append log entry
-// 	logEntry := Log{Term: 1, Command: command}
-// 	s.Logs.AppendLog(logEntry)
+	// Reject if leader's term is outdated
+	if args.Term < s.currentTerm {
+		reply.Term = s.currentTerm
+		reply.Success = false
+		return nil
+	}
 
-// 	// Leader should only append logs
-// 	if !s.leader {
-// 		fmt.Printf("Server %d is not the leader, skipping log replication\n", s.ID)
-// 		return
-// 	}
+	// Update term if needed
+	if args.Term > s.currentTerm {
+		s.currentTerm = args.Term
+		s.leader = false
+	}
 
-// 	// Replicate log entry to all peers
-// 	for _, peer := range s.Peers {
-// 		if peer.ID == s.ID {
-// 			// Skip sending message to self
-// 			continue
-// 		}
-// 		fmt.Printf("Sending log entry to peer %d at %s:%d\n", peer.ID, peer.IpAddr, peer.Port)
+	// Check log consistency (PrevLogIndex and PrevLogTerm must match)
+	if args.PrevLogIndex >= 0 && (len(s.Logs.logs) <= args.PrevLogIndex || s.Logs.logs[args.PrevLogIndex].Term != args.PrevLogTerm) {
+		reply.Success = false
+		return nil
+	}
 
-// 		// Capture and print errors
-// 		err := SendRPCMessage(peer, command)
-// 		if err != nil {
-// 			fmt.Printf("Failed to send message to peer %d (%s:%d): %v\n", peer.ID, peer.IpAddr, peer.Port, err)
-// 		}
-// 	}
-// }
+	// Append new log entries
+	s.Logs.logs = append(s.Logs.logs[:args.PrevLogIndex+1], args.Entries...)
+	s.commitIndex = args.LeaderCommit
 
+	reply.Term = s.currentTerm
+	reply.Success = true
+	return nil
+}
+
+// RequestVote handles vote requests from candidates
+func (s *Server) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Reject if the candidate's term is outdated
+	if args.Term < s.currentTerm {
+		reply.Term = s.currentTerm
+		reply.VoteGranted = false
+		return nil
+	}
+
+	// If the candidate has a newer term, update term and reset vote
+	if args.Term > s.currentTerm {
+		s.currentTerm = args.Term
+		s.votedFor = -1
+	}
+
+	// Check if we can grant the vote
+	if (s.votedFor == -1 || s.votedFor == args.CandidateID) &&
+		(args.LastLogTerm > s.getLastLogTerm() || (args.LastLogTerm == s.getLastLogTerm() && args.LastLogIndex >= s.getLastLogIndex())) {
+		s.votedFor = args.CandidateID
+		reply.VoteGranted = true
+	} else {
+		reply.VoteGranted = false
+	}
+
+	reply.Term = s.currentTerm
+	return nil
+}
+
+func (s *Server) getLastLogTerm() int {
+	panic("unimplemented")
+}
 
 // Get retrieves a value for a given key and logs the operation
 func (s *Server) Get(key string) ([]byte, error) {
