@@ -4,7 +4,8 @@ My attempt at implementing RAFT based inmemorykey-value data store
 
 Roadmap:
 
-- [] Implement a basic key-value server
+- [X] Implement a basic key-value server
+- [X] Write unit tests for in-memory key-value server
 - [] Add support for REPL
 - [] Add tests for get,put,delete
 - [] Implement logs
