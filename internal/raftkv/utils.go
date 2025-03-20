@@ -1,4 +1,4 @@
-package raftkv 
+package raftkv
 
 import (
 	"bufio"
@@ -9,18 +9,18 @@ import (
 )
 
 const (
-	TOTAL_SERVERS = 5 
+	TOTAL_SERVERS = 5 //for now let's hard code
 )
 
 // LoadServerConfig reads a config file and returns a map of ServerID -> Port
-func LoadServerConfig(configFile string) (map[int]int, error) {
+func LoadServerConfig(configFile string) (map[int]string, error) {
 	file, err := os.Open(configFile)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open config file: %v", err)
 	}
 	defer file.Close()
 
-	serverMap := make(map[int]int)
+	serverMap := make(map[int]string)
 	scanner := bufio.NewScanner(file)
 
 	for scanner.Scan() {
@@ -34,17 +34,17 @@ func LoadServerConfig(configFile string) (map[int]int, error) {
 			return nil, fmt.Errorf("invalid config format: %s", line)
 		}
 
+		ipPort := strings.TrimSpace(parts[1])
+		if err != nil {
+			return nil, fmt.Errorf("invalid port number in config: %s", parts[1])
+		}
+
 		serverID, err := strconv.Atoi(strings.TrimSpace(parts[0]))
 		if err != nil {
 			return nil, fmt.Errorf("invalid server ID in config: %s", parts[0])
 		}
 
-		port, err := strconv.Atoi(strings.TrimSpace(parts[1]))
-		if err != nil {
-			return nil, fmt.Errorf("invalid port number in config: %s", parts[1])
-		}
-
-		serverMap[serverID] = port
+		serverMap[serverID] = ipPort
 	}
 
 	if err := scanner.Err(); err != nil {

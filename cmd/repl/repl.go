@@ -5,9 +5,13 @@ import (
 	"fmt"
 	"os"
 	"raftkv/internal/raftkv"
-	"strings"
 	"strconv"
+	"strings"
 	// "raft-inmemory-kv/internal/raftkv" // Adjust the import path based on your module name
+)
+
+const (
+	LocalIpAddr = "127.0.0.1"
 )
 
 func main() {
@@ -34,13 +38,23 @@ func main() {
 	}
 
 	fmt.Println("Loaded Server Config:", serverMap)
+	// find the ip and port
 
-	// store := raftkv.NewStore() // Initialize the store
-	server := raftkv.NewServer(serverID, raftkv.LOCAL_IPADDR, serverMap[serverID]) 
+	ipPort := serverMap[serverID]
+	parts := strings.Split(ipPort, ":")
 
-	for id,port := range serverMap{
-		server.AddPeer(raftkv.Peer{ID: id, IpAddr: "127.0.0.1", Port: port})
+	myIP := parts[0]
+	myPort, err := strconv.Atoi(parts[1])
+	if err != nil {
+		fmt.Printf("Error while parsing the port: %s\n", ipPort)
 	}
+	// store := raftkv.NewStore() // Initialize the store
+	server := raftkv.NewServer(serverID, myIP, myPort, serverMap)
+
+	// for id, port := range serverMap {
+	// 	server.AddPeer(raftkv.Peer{ID: id, IpAddr: LocalIpAddr, Port: port})
+	// 	server.NodeAddressMap[ipPort] = id
+	// }
 
 	reader := bufio.NewReader(os.Stdin)
 
