@@ -57,7 +57,7 @@ func NewServer(id int, ipAddr string, port int, serverMap map[int]string) *Serve
 		Logs:           NewLogs(),
 		Peers:          []Peer{}, // Empty list, will be populated later
 		NodeAddressMap: serverMap,
-		currentTerm:    0,
+		currentTerm:    1,
 		commitIndex:    -1,
 	}
 
@@ -109,44 +109,47 @@ func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
 	decoder := gob.NewDecoder(conn)
 
-	for {
-		var msg RaftMessage
-		if err := decoder.Decode(&msg); err != nil {
-			fmt.Println("Failed to decode RaftMessage:", err)
-			return
-		}
-
-		fmt.Printf("Received RaftMessage: Type=%d, SenderID=%d\n", msg.Type, msg.SenderID)
-
-		nodeID := msg.SenderID
-
-		if _, exists := s.NodeAddressMap[nodeID]; !exists {
-			fmt.Println("Unknown sender ID:", nodeID)
-			return
-		}
-
-		switch data := msg.Data.(type) { // Type assertion
-		case AppendEntriesRequest:
-			s.handleAppendEntries(data, nodeID)
-
-		case AppendEntriesResponse:
-			s.handleAppendEntriesResponse(data, nodeID)
-
-		// case VoteRequest:
-		// 	s.handleVoteRequest(data, nodeID)
-
-		// case VoteResponse:
-		// 	s.handleVoteResponse(data, nodeID)
-
-		default:
-			fmt.Println("Unknown message type:", msg.Type)
-		}
+	// for {
+	var msg RaftMessage
+	if err := decoder.Decode(&msg); err != nil {
+		fmt.Println("Failed to decode RaftMessage:", err)
+		return
 	}
+
+	fmt.Printf("Received RaftMessage: Type=%d, SenderID=%d\n", msg.Type, msg.SenderID)
+
+	nodeID := msg.SenderID
+
+	if _, exists := s.NodeAddressMap[nodeID]; !exists {
+		fmt.Println("Unknown sender ID:", nodeID)
+		return
+	}
+	switch msg.Type { // Type assertion
+	case AppendEntriesRPC:
+		data := msg.Data.(AppendEntriesRequest)
+		s.handleAppendEntries(data, nodeID)
+
+	case AppendEntriesResponseRPC:
+		data := msg.Data.(AppendEntriesResponse)
+		s.handleAppendEntriesResponse(data, nodeID)
+
+	// case VoteRequest:
+	// 	s.handleVoteRequest(data, nodeID)
+
+	// case VoteResponse:
+	// 	s.handleVoteResponse(data, nodeID)
+
+	default:
+		fmt.Println("Unknown message type:", msg.Type)
+	}
+	// }
 }
 
 func (s *Server) handleAppendEntries(req AppendEntriesRequest, nodeID int) AppendEntriesResponse {
+	fmt.Println("Received appendEntriesRequest ", req)
 	// if the current term in the request is lower, reject it
 	if req.Term < s.currentTerm {
+		fmt.Println("request term is lower than currentTerm")
 		return AppendEntriesResponse{
 			Term:    s.currentTerm,
 			Success: false,
@@ -164,11 +167,15 @@ func (s *Server) handleAppendEntries(req AppendEntriesRequest, nodeID int) Appen
 	//
 
 	// check if the log contains an entry at prevLogIndex with matching prevLogTerm
+	fmt.Printf("prev log index %d prev log term %d", req.PrevLogIndex, req.PrevLogTerm)
 	if req.PrevLogIndex >= 0 {
+
 		if req.PrevLogIndex >= len(s.Logs.logs) || s.Logs.logs[req.PrevLogIndex].Term != req.PrevLogTerm {
+			fmt.Println("Returning early")
 			return AppendEntriesResponse{
-				Term:    s.currentTerm,
-				Success: false,
+				Term:         s.currentTerm,
+				Success:      false,
+				LastLogIndex: len(s.Logs.logs),
 			}
 		}
 	}
@@ -186,11 +193,14 @@ func (s *Server) handleAppendEntries(req AppendEntriesRequest, nodeID int) Appen
 		s.applyCommittedEntries(req.Entries)
 	}
 
-	return AppendEntriesResponse{
-		Term:    s.currentTerm,
-		Success: true,
-	}
+	//for now let's just apply committed entries
+	s.applyCommittedEntries(req.Entries)
 
+	return AppendEntriesResponse{
+		Term:         s.currentTerm,
+		Success:      true,
+		LastLogIndex: len(s.Logs.logs),
+	}
 }
 
 func (s *Server) handleAppendEntriesResponse(res AppendEntriesResponse, fromID int) {
@@ -214,10 +224,16 @@ func (s *Server) handleAppendEntriesResponse(res AppendEntriesResponse, fromID i
 ///////////////////////////////////////////////////////////////////////////////
 
 func (s *Server) applyCommittedEntries(entries []Log) {
+	fmt.Println("Applying committed Entries")
+
 	for _, entry := range entries {
+		fmt.Printf("🔄 Processing raw command on Server %d: %q\n", s.ID, entry.Command) // Log with quotes
+		fmt.Printf("Command type: %T, Value: %v\n", entry.Command, entry.Command)
+
 		s.ProcessCommand(entry.Command)
 	}
 }
+
 func (s *Server) ProcessCommand(command string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -236,9 +252,10 @@ func (s *Server) ProcessCommand(command string) {
 			fmt.Println("❌ Invalid SET command")
 			return
 		}
+
 		key, value := parts[1], parts[2]
 		s.Store.Set(key, []byte(value))
-		s.Logs.AppendLog(Log{Term: 1, Command: command})
+		s.Logs.AppendLog(Log{Term: s.currentTerm, Command: command})
 		fmt.Printf("✅ Server %d SET %s = %s\n", s.ID, key, value)
 
 	case "GET":
@@ -253,7 +270,7 @@ func (s *Server) ProcessCommand(command string) {
 	case "DELETE":
 		key := parts[1]
 		s.Store.Delete(key)
-		s.Logs.AppendLog(Log{Term: 1, Command: command})
+		s.Logs.AppendLog(Log{Term: s.currentTerm, Command: command})
 		fmt.Printf("✅ Server %d DELETED %s\n", s.ID, key)
 
 	default:
@@ -275,12 +292,13 @@ func (s *Server) SetLeader() {
 ///////////////////////////////////////////////////////////////////////////////
 // AppendEntry applies an operation and replicates it to peers
 
-func (s *Server) AppendEntry(command string) {
+func (s *Server) AppendEntry(logEntry Log) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	// Create log entry
-	logEntry := Log{Term: 1, Command: command}
+	// logEntry := Log{Term: 1, Command: command}
+	// Append command to own log
 	s.Logs.AppendLog(logEntry)
 
 	// Leader should replicate log to peers
@@ -298,14 +316,13 @@ func (s *Server) AppendEntry(command string) {
 			continue
 		}
 
+		fmt.Printf("Sending command to %d %s\n", peerID, peerIpPort)
+
 		// err := SendRPCMessage(peer, logEntry) // Send entire Log struct
 		entries := make([]Log, 1)
-		entries[0] = Log{
-			Term:    s.currentTerm,
-			Command: command,
-		}
+		entries[0] = logEntry
 
-		prevLogIndex := len(s.Logs.logs) - 1 // Last log entry index
+		prevLogIndex := len(s.Logs.logs) - 2 // Last log entry index
 		prevLogTerm := 0                     // Default if no previous logs
 		if prevLogIndex >= 0 {
 			prevLogTerm = s.Logs.logs[prevLogIndex].Term
@@ -317,31 +334,32 @@ func (s *Server) AppendEntry(command string) {
 			PrevLogIndex: prevLogIndex,
 			PrevLogTerm:  prevLogTerm,
 			Entries:      entries,
+			LeaderCommit: s.commitIndex,
 		}
 
-		encodedData, err := Encode(appendEntriesReq)
-		if err != nil {
-			fmt.Println("Encoding error:", err)
-			return
-		}
+		// encodedData, err := Encode(appendEntriesReq)
+		// if err != nil {
+		// 	fmt.Println("Encoding error:", err)
+		// 	return
+		// }
 
 		raftMessage := RaftMessage{
 			Type:     AppendEntriesRPC,
-			Data:     encodedData,
+			Data:     appendEntriesReq,
 			SenderID: s.ID,
 		}
 
 		parts := strings.Split(peerIpPort, ":")
 
-		myIP := parts[0]
-		myPort, err := strconv.Atoi(parts[1])
+		peerIP := parts[0]
+		peerPort, err := strconv.Atoi(parts[1])
 		if err != nil {
 			fmt.Printf("Error while parsing the port: %s\n", peerIpPort)
 		}
 		peer := Peer{
-			ID:     s.ID,
-			IpAddr: myIP,
-			Port:   myPort,
+			ID:     peerID,
+			IpAddr: peerIP,
+			Port:   peerPort,
 		}
 
 		err = sendMessage(peer, raftMessage)
@@ -435,8 +453,8 @@ func (s *Server) Get(key string) ([]byte, error) {
 	}
 
 	// Log the GET operation (optional, since GETs are read-only)
-	logEntry := Log{Term: 1, Command: fmt.Sprintf("GET %s", key)}
-	s.AppendEntry(logEntry.String())
+	logEntry := Log{Term: s.currentTerm, Command: fmt.Sprintf("GET %s", key)}
+	s.AppendEntry(logEntry)
 
 	return val, nil
 }
@@ -444,8 +462,8 @@ func (s *Server) Get(key string) ([]byte, error) {
 // Set adds or updates a key-value pair and logs the operation
 func (s *Server) Set(key string, val []byte) {
 	// Log the SET operation
-	logEntry := Log{Term: 1, Command: fmt.Sprintf("SET %s %s", key, string(val))}
-	s.AppendEntry(logEntry.String())
+	logEntry := Log{Term: s.currentTerm, Command: fmt.Sprintf("SET %s %s", key, string(val))}
+	s.AppendEntry(logEntry)
 	s.Store.Set(key, val)
 
 }
@@ -453,8 +471,8 @@ func (s *Server) Set(key string, val []byte) {
 // Delete removes a key from the store and logs the operation
 func (s *Server) Delete(key string) {
 	// Log the DELETE operation
-	logEntry := Log{Term: 1, Command: fmt.Sprintf("DELETE %s", key)}
-	s.AppendEntry(logEntry.String())
+	logEntry := Log{Term: s.currentTerm, Command: fmt.Sprintf("DELETE %s", key)}
+	s.AppendEntry(logEntry)
 
 	s.Store.Delete(key)
 }
@@ -474,4 +492,12 @@ func Decode(data []byte, msg interface{}) error {
 	buf := bytes.NewBuffer(data)
 	dec := gob.NewDecoder(buf)
 	return dec.Decode(msg)
+}
+
+// Encode message to byte slice
+func Encode(msg interface{}) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	err := enc.Encode(msg)
+	return buf.Bytes(), err
 }

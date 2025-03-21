@@ -1,7 +1,6 @@
 package raftkv
 
 import (
-	"bytes"
 	"encoding/gob"
 	"fmt"
 	"net"
@@ -11,14 +10,6 @@ import (
 const (
 	RPC_TIMEOUT = 3 * time.Second
 )
-
-func init() {
-	gob.Register(RaftMessage{})
-	gob.Register(AppendEntriesRequest{})
-	gob.Register(AppendEntriesResponse{})
-	gob.Register(VoteRequest{})
-	gob.Register(VoteResponse{})
-}
 
 func sendMessage(peer Peer, msg RaftMessage) error {
 
@@ -82,12 +73,4 @@ type AppendEntriesResponse struct {
 	Term         int
 	Success      bool
 	LastLogIndex int // this is not mentioned in paper but having this makes life easy
-}
-
-// Encode message to byte slice
-func Encode(msg interface{}) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
-	err := enc.Encode(msg)
-	return buf.Bytes(), err
 }
