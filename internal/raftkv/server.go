@@ -30,7 +30,6 @@ type Server struct {
 	Port           int            // port
 	Logs           *Logs          // Log storage for RAFT replication
 	Store          *Store         // The actual key-value store
-	Peers          []Peer         // List of peer servers
 	NodeAddressMap map[int]string // map of node ip:port to int
 	currentTerm    int            // current term
 	votedFor       int            // id of the server to whom the vote was given in current term
@@ -55,7 +54,6 @@ func NewServer(id int, ipAddr string, port int, serverMap map[int]string) *Serve
 		Port:           port,
 		Store:          NewStore(),
 		Logs:           NewLogs(),
-		Peers:          []Peer{}, // Empty list, will be populated later
 		NodeAddressMap: serverMap,
 		currentTerm:    1,
 		commitIndex:    -1,
@@ -320,11 +318,16 @@ func (s *Server) AppendEntry(logEntry Log) {
 		fmt.Printf("Sending command to %d %s\n", peerID, peerIpPort)
 
 		// err := SendRPCMessage(peer, logEntry) // Send entire Log struct
-		entries := make([]Log, 1)
-		entries[0] = logEntry
+		lastMatchindex, exists := s.matchIndex[peerID]
+		if !exists {
+			lastMatchindex = -1
+		}
+		// from lastMatchIndex+1 to whatever is there
+		entries := s.Logs.logs[lastMatchindex+1:]
 
-		prevLogIndex := len(s.Logs.logs) - 2 // Last log entry index
-		prevLogTerm := 0                     // Default if no previous logs
+		prevLogIndex := lastMatchindex // Last log entry index, since we have already
+		// added the latest log we need to subtract by 2 to find the previous
+		prevLogTerm := 0 // Default if no previous logs
 		if prevLogIndex >= 0 {
 			prevLogTerm = s.Logs.logs[prevLogIndex].Term
 		}
