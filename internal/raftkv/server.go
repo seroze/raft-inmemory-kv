@@ -167,10 +167,10 @@ func (s *Server) handleAppendEntries(req AppendEntriesRequest, nodeID int) Appen
 	//
 
 	// check if the log contains an entry at prevLogIndex with matching prevLogTerm
-	fmt.Printf("prev log index %d prev log term %d", req.PrevLogIndex, req.PrevLogTerm)
-	if req.PrevLogIndex >= 0 {
-
-		if req.PrevLogIndex >= len(s.Logs.logs) || s.Logs.logs[req.PrevLogIndex].Term != req.PrevLogTerm {
+	fmt.Printf("prev log index %d prev log term %d\n", req.PrevLogIndex, req.PrevLogTerm)
+	if req.PrevLogIndex >= 0 && req.PrevLogIndex <= len(s.Logs.logs)-1 {
+		fmt.Println(s.Logs.logs, " logs")
+		if s.Logs.logs[req.PrevLogIndex].Term != req.PrevLogTerm {
 			fmt.Println("Returning early")
 			return AppendEntriesResponse{
 				Term:         s.currentTerm,
@@ -182,6 +182,7 @@ func (s *Server) handleAppendEntries(req AppendEntriesRequest, nodeID int) Appen
 
 	// check if the log contains an entry at prevLogIndex with matching prevLogTerm
 	if len(req.Entries) > 0 {
+		fmt.Println(req.Entries, " req.Entries")
 		s.Logs.logs = s.Logs.logs[:req.PrevLogIndex+1] // Delete conflicting entries
 		s.Logs.logs = append(s.Logs.logs, req.Entries...)
 	}
