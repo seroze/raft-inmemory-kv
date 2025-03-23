@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/gob"
 	"fmt"
+	"math/rand"
 	"net"
 	"strconv"
 	"strings"
@@ -12,7 +13,9 @@ import (
 )
 
 const (
-	LOCAL_IPADDR = "127.0.0.1"
+	LOCAL_IPADDR       = "127.0.0.1"
+	ElectionTimeoutMin = 150 * time.Millisecond
+	ElectionTimeoutMax = 150 * time.Millisecond
 )
 
 func init() {
@@ -38,6 +41,12 @@ type Server struct {
 	nextIndex      map[int]int    // map of next Index
 	mu             sync.Mutex     // Mutex to prevent race conditions
 	leader         bool           // If true, this server is the leader
+
+	// election related logic
+	electionTimer        *time.Timer
+	electionTimeout      time.Duration
+	resetElectionTimerCh chan struct{}
+	stopCh               chan struct{}
 }
 
 type Peer struct {
@@ -57,12 +66,20 @@ func NewServer(id int, ipAddr string, port int, serverMap map[int]string) *Serve
 		NodeAddressMap: serverMap,
 		currentTerm:    1,
 		commitIndex:    -1,
+
+		//election related logic
+		votedFor:             -1,
+		leader:               false,
+		resetElectionTimerCh: make(chan struct{}),
+		stopCh:               make(chan struct{}),
 	}
 
 	if server.ID == 1 {
 		//set node 1 as leader for now, will remove this once leader election is in place
 		server.SetLeader()
 	}
+	server.resetElectionTimer()
+	go server.runElectionTimer()
 
 	// Start listening for incoming messages
 	go server.Listen()
@@ -78,6 +95,36 @@ func NewServer(id int, ipAddr string, port int, serverMap map[int]string) *Serve
 	}()
 
 	return server
+}
+
+func (s *Server) resetElectionTimer() {
+	if s.electionTimer != nil {
+		s.electionTimer.Stop()
+	}
+
+	s.electionTimeout = time.Duration(rand.Int63n(int64(ElectionTimeoutMax-ElectionTimeoutMin))
+						+ int64(ElectionTimeoutMin))
+	s.electionTimer = time.NewTimer(s.electionTimeout)
+}
+
+func (s *Server) runElectionTimer() {
+	for {
+		select {
+
+			case <- s.electionTimer.C:
+				// Election timeout elapsed, start an election pls
+				s.startElection()
+			case <- s.resetElectionTimerCh:
+				// reset the election timer
+				s.resetElectionTimer()
+			case <- s.stopCh:
+				// Stop the election timer
+				if s.electionTimer!=nil{
+					s.electionTimer.Stop()
+				}
+				return
+		}
+	}
 }
 
 func (s *Server) Listen() {
@@ -122,6 +169,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 		fmt.Println("Unknown sender ID:", nodeID)
 		return
 	}
+
 	switch msg.Type { // Type assertion
 	case AppendEntriesRPC:
 		data := msg.Data.(AppendEntriesRequest)
@@ -131,11 +179,11 @@ func (s *Server) handleConnection(conn net.Conn) {
 		data := msg.Data.(AppendEntriesResponse)
 		s.handleAppendEntriesResponse(data, nodeID)
 
-	// case VoteRequest:
-	// 	s.handleVoteRequest(data, nodeID)
+		// case VoteRequest:
+		// 	s.handleVoteRequest(data, nodeID)
 
-	// case VoteResponse:
-	// 	s.handleVoteResponse(data, nodeID)
+		// case VoteResponse:
+		// 	s.handleVoteResponse(data, nodeID)
 
 	default:
 		fmt.Println("Unknown message type:", msg.Type)
@@ -161,7 +209,7 @@ func (s *Server) handleAppendEntries(req AppendEntriesRequest, nodeID int) Appen
 	}
 
 	// reset election timeout since we've received a valid heart beat
-	// resetElectionTimer()
+	s.resetElectionTimer()
 	//
 
 	// check if the log contains an entry at prevLogIndex with matching prevLogTerm
@@ -204,8 +252,9 @@ func (s *Server) handleAppendEntries(req AppendEntriesRequest, nodeID int) Appen
 
 func (s *Server) handleAppendEntriesResponse(res AppendEntriesResponse, fromID int) {
 	if res.Success {
-		// Update matchIndex and nextIndex for the follower
+		// Is this correct ?
 		s.matchIndex[fromID] = res.LastLogIndex
+		// Update nextIndex
 		s.nextIndex[fromID] = res.LastLogIndex + 1
 		fmt.Printf("AppendEntries succeeded for %d, updated matchIndex: %d, nextIndex: %d\n",
 			fromID, s.matchIndex[fromID], s.nextIndex[fromID])
@@ -318,7 +367,7 @@ func (s *Server) AppendEntry(logEntry Log) {
 		fmt.Printf("Sending command to %d %s\n", peerID, peerIpPort)
 
 		// err := SendRPCMessage(peer, logEntry) // Send entire Log struct
-		lastMatchindex, exists := s.matchIndex[peerID]
+		lastMatchindex, exists := s.nextIndex[peerID]
 		if !exists {
 			lastMatchindex = -1
 		}
