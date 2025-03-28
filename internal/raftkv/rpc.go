@@ -62,10 +62,8 @@ type VoteRequest struct {
 
 // Vote Response
 type VoteResponse struct {
-	Term         int
-	CandidateID  int
-	LastLogIndex int
-	LastLogTerm  int
+	Term        int
+	VoteGranted bool
 }
 
 // AppendEntriesResponse

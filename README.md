@@ -10,10 +10,12 @@ Roadmap:
 - [X] Implement logs
 - [X] Implement naive log replication
 - [X] Test naive replication
-- [] Implement AppendEntries and AppendEntriesResponse RPC
-- [] Test AppendEntries and AppendEntriesResponse RPC
-- [] Implement leader election via VoteRequest and VoteResponse RPC
-- [] Test leader election
+- [X] Implement AppendEntries and AppendEntriesResponse RPC
+- [X] Test AppendEntries and AppendEntriesResponse RPC
+- [X] Implement leader election via VoteRequest and VoteResponse RPC
+- [-] Test leader election
+- [] Persist node state
+- [] Persist log state
 
 Issues:
 

@@ -9,13 +9,24 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const (
 	LOCAL_IPADDR       = "127.0.0.1"
 	ElectionTimeoutMin = 150 * time.Millisecond
-	ElectionTimeoutMax = 150 * time.Millisecond
+	ElectionTimeoutMax = 300 * time.Millisecond
+	HeartBeatInterval  = 50 * time.Millisecond
+)
+
+// go doesn't support enum keyword but you can define it via constants and iota
+type State int
+
+const (
+	Follower State = iota
+	Candidate
+	Leader
 )
 
 func init() {
@@ -35,7 +46,6 @@ type Server struct {
 	Store          *Store         // The actual key-value store
 	NodeAddressMap map[int]string // map of node ip:port to int
 	currentTerm    int            // current term
-	votedFor       int            // id of the server to whom the vote was given in current term
 	commitIndex    int            // commit index
 	matchIndex     map[int]int    // map of match index
 	nextIndex      map[int]int    // map of next Index
@@ -43,10 +53,13 @@ type Server struct {
 	leader         bool           // If true, this server is the leader
 
 	// election related logic
+	state                State
+	votedFor             int // id of the server to whom the vote was given in current term
+	votesReceived        int32
 	electionTimer        *time.Timer
 	electionTimeout      time.Duration
 	resetElectionTimerCh chan struct{}
-	stopCh               chan struct{}
+	stopCh               chan struct{} // used for graceful shutdown
 }
 
 type Peer struct {
@@ -67,18 +80,18 @@ func NewServer(id int, ipAddr string, port int, serverMap map[int]string) *Serve
 		currentTerm:    1,
 		commitIndex:    -1,
 
-		//election related logic
-		votedFor:             -1,
+		// election related logic
+		state:                Follower,
+		votedFor:             -1, // currently pointing to no one
+		votesReceived:        0,
 		leader:               false,
 		resetElectionTimerCh: make(chan struct{}),
 		stopCh:               make(chan struct{}),
 	}
 
-	if server.ID == 1 {
-		//set node 1 as leader for now, will remove this once leader election is in place
-		server.SetLeader()
-	}
-	server.resetElectionTimer()
+	// Initialize election timer
+	server.resetElectionTimer() // This is crucial
+
 	go server.runElectionTimer()
 
 	// Start listening for incoming messages
@@ -97,32 +110,243 @@ func NewServer(id int, ipAddr string, port int, serverMap map[int]string) *Serve
 	return server
 }
 
-func (s *Server) resetElectionTimer() {
-	if s.electionTimer != nil {
-		s.electionTimer.Stop()
+func (s *Server) startElection() {
+	// s.mu.Lock()
+	// defer s.mu.Unlock()
+
+	// // Some basic checks
+	// // don't start an election if we're not a follower or candidate
+	// if s.state == Leader {
+	// 	// it means we are not follower or candidate
+	// 	return
+	// }
+
+	// // change state
+	// s.state = Candidate
+	// // increase currentTerm
+	// s.currentTerm++
+	// // vote for self
+	// s.votedFor = s.ID
+
+	// // persist state information
+	// // s.persistState()
+	// //
+
+	// // prepare vote request object
+	// // var lastLogIndex, lastLogTerm int
+	lastLogIndex, lastLogTerm := s.getLastLogAndLastTerm()
+	voteRequest := VoteRequest{
+		Term:         s.currentTerm,
+		CandidateID:  s.ID,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  lastLogTerm,
+	}
+	raftMessage := RaftMessage{
+		Type:     VoteRPC,
+		Data:     voteRequest,
+		SenderID: s.ID,
 	}
 
-	s.electionTimeout = time.Duration(rand.Int63n(int64(ElectionTimeoutMax-ElectionTimeoutMin))
-						+ int64(ElectionTimeoutMin))
-	s.electionTimer = time.NewTimer(s.electionTimeout)
+	// // Unlock while waiting for RPC responses
+	// s.mu.Unlock()
+
+	// // Send RequestVote RPCs to all other servers in parallel
+	// // Start with 1 for self-vote
+	// atomic.AddInt32(&s.votesReceived, 1)
+
+	var wg sync.WaitGroup
+
+	s.mu.Lock()
+	defer s.mu.Unlock() // Use defer to ensure unlock happens
+
+	if s.state == Leader {
+		return
+	}
+
+	s.state = Candidate
+	s.currentTerm++
+	s.votedFor = s.ID
+	atomic.StoreInt32(&s.votesReceived, 1) // Reset vote count
+
+	// Send log entry to all peers
+	// for _, peer := range s.Peers {
+	for peerID, peerIpPort := range s.NodeAddressMap {
+		if peerID == s.ID {
+			// Skip sending to self
+			continue
+		}
+		wg.Add(1)
+		go func(peerIpPort string) {
+			defer wg.Done()
+
+			// reply := RequestVoteReply
+			parts := strings.Split(peerIpPort, ":")
+
+			peerIP := parts[0]
+			peerPort, err := strconv.Atoi(parts[1])
+			if err != nil {
+				fmt.Printf("Error while parsing the port: %s\n", peerIpPort)
+			}
+			peer := Peer{
+				ID:     peerID,
+				IpAddr: peerIP,
+				Port:   peerPort,
+			}
+
+			err = sendMessage(peer, raftMessage)
+			if err != nil {
+				fmt.Printf("❌ Failed to send vote request to peer %d (%s:%d): %v\n", peer.ID, peer.IpAddr, peer.Port, err)
+			}
+		}(peerIpPort)
+	}
+
+	// Wait for all RPCs to complete (or timeout)
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// All  RPCs completed
+	case <-time.After(s.electionTimeout):
+		// Election timed out
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+}
+
+func (s *Server) startHeartBeats() {
+
+	if s.state != Leader {
+		// Only leaders send heart beat
+		return
+	}
+
+	// Typically much shorter than election timeout
+	ticker := time.NewTicker(HeartBeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if s.state != Leader {
+				return // Stop if we're no longer leader
+			}
+			s.sendHeartBeat()
+		case <-s.stopCh:
+			return // Stop on shutdown signal
+		}
+	}
+}
+
+// Sends heart beat to all it's peers
+func (s *Server) sendHeartBeat() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for peerID, peerIpPort := range s.NodeAddressMap {
+		if peerID == s.ID {
+			continue // Skip self
+		}
+
+		// Get the nextIndex for this peer
+		nextIdx, exists := s.nextIndex[peerID]
+		if !exists {
+			nextIdx = 0 // Initialize if not exists
+			s.nextIndex[peerID] = 0
+			s.matchIndex[peerID] = -1
+		}
+
+		// Prepare the AppendEntries RPC arguments
+		prevLogIndex := nextIdx - 1
+		prevLogTerm := -1
+		if prevLogIndex >= 0 && prevLogIndex < len(s.Logs.logs) {
+			prevLogTerm = s.Logs.logs[prevLogIndex].Term
+		}
+
+		// For heartbeats, we send empty entries (unless we need to replicate)
+		entries := []Log{}
+		if nextIdx < len(s.Logs.logs) {
+			// There are new entries to replicate
+			entries = s.Logs.logs[nextIdx:]
+		}
+
+		req := AppendEntriesRequest{
+			Term:         s.currentTerm,
+			LeaderID:     s.ID,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  prevLogTerm,
+			Entries:      entries,
+			LeaderCommit: s.commitIndex,
+		}
+
+		// Send the heartbeat in a goroutine so we don't block
+		go func(peerID int, peerIpPort string, req AppendEntriesRequest) {
+			parts := strings.Split(peerIpPort, ":")
+			peerIP := parts[0]
+			peerPort, _ := strconv.Atoi(parts[1])
+
+			peer := Peer{
+				ID:     peerID,
+				IpAddr: peerIP,
+				Port:   peerPort,
+			}
+
+			raftMessage := RaftMessage{
+				Type:     AppendEntriesRPC,
+				Data:     req,
+				SenderID: s.ID,
+			}
+
+			err := sendMessage(peer, raftMessage)
+			if err != nil {
+				fmt.Printf("❌ Failed to send heartbeat to peer %d: %v\n", peerID, err)
+			}
+		}(peerID, peerIpPort, req)
+	}
+}
+
+func (s *Server) resetElectionTimer() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Calculate random duration between min and max
+	timeoutRange := ElectionTimeoutMax - ElectionTimeoutMin
+	randomOffset := time.Duration(rand.Int63n(int64(timeoutRange)))
+	s.electionTimeout = ElectionTimeoutMin + randomOffset
+
+	// Initialize or reset timer
+	if s.electionTimer == nil {
+		s.electionTimer = time.NewTimer(s.electionTimeout)
+	} else {
+		if !s.electionTimer.Stop() {
+			select {
+			case <-s.electionTimer.C:
+			default:
+			}
+		}
+		s.electionTimer.Reset(s.electionTimeout)
+	}
 }
 
 func (s *Server) runElectionTimer() {
 	for {
 		select {
-
-			case <- s.electionTimer.C:
-				// Election timeout elapsed, start an election pls
-				s.startElection()
-			case <- s.resetElectionTimerCh:
-				// reset the election timer
-				s.resetElectionTimer()
-			case <- s.stopCh:
-				// Stop the election timer
-				if s.electionTimer!=nil{
-					s.electionTimer.Stop()
-				}
-				return
+		case <-s.electionTimer.C:
+			// Election timeout elapsed, start an election
+			s.startElection()
+		case <-s.resetElectionTimerCh:
+			// reset the election timer
+			s.resetElectionTimer()
+		case <-s.stopCh:
+			// Stop the election timer
+			if s.electionTimer != nil {
+				s.electionTimer.Stop()
+			}
+			return
 		}
 	}
 }
@@ -173,22 +397,149 @@ func (s *Server) handleConnection(conn net.Conn) {
 	switch msg.Type { // Type assertion
 	case AppendEntriesRPC:
 		data := msg.Data.(AppendEntriesRequest)
-		s.handleAppendEntries(data, nodeID)
+
+		response := s.handleAppendEntries(data, nodeID)
+
+		// Send response back to leader
+		replyMsg := RaftMessage{
+			Type:     AppendEntriesResponseRPC,
+			Data:     response,
+			SenderID: s.ID,
+		}
+		s.sendRaftMessage(nodeID, replyMsg)
 
 	case AppendEntriesResponseRPC:
 		data := msg.Data.(AppendEntriesResponse)
 		s.handleAppendEntriesResponse(data, nodeID)
 
-		// case VoteRequest:
-		// 	s.handleVoteRequest(data, nodeID)
+	case VoteRPC:
+		data := msg.Data.(VoteRequest)
+		response := s.handleVoteRequest(data, nodeID)
+		// Send response back to the candidate
+		replyMsg := RaftMessage{
+			Type:     VoteResponseRPC,
+			Data:     response,
+			SenderID: s.ID,
+		}
+		s.sendRaftMessage(nodeID, replyMsg)
 
-		// case VoteResponse:
-		// 	s.handleVoteResponse(data, nodeID)
+	case VoteResponseRPC:
+		data := msg.Data.(VoteResponse)
+		s.handleVoteResponse(data, nodeID)
 
 	default:
 		fmt.Println("Unknown message type:", msg.Type)
 	}
 	// }
+}
+
+func (s *Server) handleVoteRequest(data VoteRequest, nodeID int) VoteResponse {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Initialize response with current term
+	voteResponse := VoteResponse{
+		Term:        s.currentTerm,
+		VoteGranted: false,
+	}
+
+	// Rule 1: If request term is older than our current term, reject
+	if s.currentTerm > data.Term {
+		return voteResponse
+	}
+
+	// Rule 2: If request term is newer, update our term and convert to follower
+	if data.Term > s.currentTerm {
+		s.currentTerm = data.Term
+		s.state = Follower
+		s.votedFor = -1
+		// Note: Should persist state here in a real implementation
+		voteResponse.Term = data.Term
+	}
+
+	// Rule 3: Check voting eligibility
+	lastLogIndex, lastLogTerm := s.getLastLogAndLastTerm()
+	candidateLogOK := (data.LastLogTerm > lastLogTerm) ||
+		(data.LastLogTerm == lastLogTerm && data.LastLogIndex >= lastLogIndex)
+
+	canVote := (s.votedFor == -1 || s.votedFor == nodeID) && candidateLogOK
+
+	// Rule 4: Grant vote if:
+	// - We haven't voted for anyone else this term
+	// - Candidate's log is at least as up-to-date as ours
+	if canVote {
+		s.votedFor = nodeID
+		s.resetElectionTimer() // Reset our election timeout when granting vote
+		voteResponse.VoteGranted = true
+		// Note: Should persist state here in a real implementation
+	}
+
+	return voteResponse
+}
+
+func (s *Server) handleVoteResponse(res VoteResponse, fromID int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Debug logging
+	fmt.Printf("Server %d processing vote response from %d: granted=%v, term=%d (current term=%d)\n",
+		s.ID, fromID, res.VoteGranted, res.Term, s.currentTerm)
+
+	// 1. If response term > currentTerm, step down to follower
+	if res.Term > s.currentTerm {
+		fmt.Printf("Server %d found newer term in vote response, stepping down\n", s.ID)
+		s.currentTerm = res.Term
+		s.state = Follower
+		s.votedFor = -1
+		s.resetElectionTimer()
+		return
+	}
+
+	// 2. Ignore if we're not candidate or terms don't match
+	if s.state != Candidate || res.Term != s.currentTerm {
+		fmt.Printf("Server %d ignoring vote response - not candidate or term mismatch\n", s.ID)
+		return
+	}
+
+	// 3. Count the vote if granted
+	if res.VoteGranted {
+		votes := atomic.AddInt32(&s.votesReceived, 1)
+		fmt.Printf("Server %d received vote from %d (total votes=%d)\n",
+			s.ID, fromID, votes)
+	}
+
+	// 4. Check if we've won the election
+	majority := len(s.NodeAddressMap)/2 + 1
+	currentVotes := int(atomic.LoadInt32(&s.votesReceived))
+
+	if currentVotes >= majority {
+		fmt.Printf("Server %d achieved majority with %d votes (needed %d)\n",
+			s.ID, currentVotes, majority)
+
+		// Transition to leader
+		s.state = Leader
+		s.leader = true
+		s.votedFor = -1
+
+		// Initialize leader state
+		lastLogIndex, _ := s.getLastLogAndLastTerm()
+		s.nextIndex = make(map[int]int)
+		s.matchIndex = make(map[int]int)
+
+		for peerID := range s.NodeAddressMap {
+			s.nextIndex[peerID] = lastLogIndex + 1
+			s.matchIndex[peerID] = 0
+		}
+
+		// Send initial empty AppendEntries as heartbeat
+		go s.startHeartBeats()
+
+		fmt.Printf("Server %d is now LEADER for term %d\n", s.ID, s.currentTerm)
+	} else {
+		remainingVotes := majority - currentVotes
+		fmt.Printf("Server %d needs %d more votes to become leader\n",
+			s.ID, remainingVotes)
+	}
 }
 
 func (s *Server) handleAppendEntries(req AppendEntriesRequest, nodeID int) AppendEntriesResponse {
@@ -333,7 +684,7 @@ func (s *Server) ProcessCommand(command string) {
 
 // SetLeader makes this server the leader
 func (s *Server) SetLeader() {
-	s.leader = true
+	s.state = Leader
 	fmt.Printf("Server %d is now the leader\n", s.ID)
 }
 
@@ -350,7 +701,7 @@ func (s *Server) AppendEntry(logEntry Log) {
 	s.Logs.AppendLog(logEntry)
 
 	// Leader should replicate log to peers
-	if !s.leader {
+	if s.state != Leader {
 		fmt.Printf("❌ Server %d is not the leader, skipping replication\n", s.ID)
 		return
 	}
@@ -422,81 +773,56 @@ func (s *Server) AppendEntry(logEntry Log) {
 	}
 }
 
-// // AppendEntries handles log replication from the leader
-// func (s *Server) AppendEntries(args AppendEntriesArgs, reply AppendEntriesReply) error {
-// 	s.mu.Lock()
-// 	defer s.mu.Unlock()
+// sendRaftMessage sends a Raft message to a peer identified by ID
+func (s *Server) sendRaftMessage(peerID int, raftMessage RaftMessage) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-// 	// Reject if leader's term is outdated
-// 	if args.Term < s.currentTerm {
-// 		reply.Term = s.currentTerm
-// 		reply.Success = false
-// 		return nil
-// 	}
+	// Get peer address from the node map
+	peerIpPort, exists := s.NodeAddressMap[peerID]
+	if !exists {
+		return fmt.Errorf("unknown peer ID: %d", peerID)
+	}
 
-// 	// Update term if needed
-// 	if args.Term > s.currentTerm {
-// 		s.currentTerm = args.Term
-// 		s.leader = false
-// 	}
+	// Parse peer address
+	parts := strings.Split(peerIpPort, ":")
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid peer address format: %s", peerIpPort)
+	}
 
-// 	// Check log consistency (PrevLogIndex and PrevLogTerm must match)
-// 	if args.PrevLogIndex >= 0 && (len(s.Logs.logs) <= args.PrevLogIndex || s.Logs.logs[args.PrevLogIndex].Term != args.PrevLogTerm) {
-// 		reply.Success = false
-// 		return nil
-// 	}
+	peerIP := parts[0]
+	peerPort, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return fmt.Errorf("invalid port number: %s", parts[1])
+	}
 
-// 	// Append new log entries
-// 	s.Logs.logs = append(s.Logs.logs[:args.PrevLogIndex+1], args.Entries...)
-// 	s.commitIndex = args.LeaderCommit
+	// Create peer struct
+	peer := Peer{
+		ID:     peerID,
+		IpAddr: peerIP,
+		Port:   peerPort,
+	}
 
-// 	reply.Term = s.currentTerm
-// 	reply.Success = true
-// 	return nil
-// }
+	if err := sendMessage(peer, raftMessage); err != nil {
+		return fmt.Errorf("failed to send message to peer %d (%s:%d): %w",
+			peer.ID, peer.IpAddr, peer.Port, err)
+	}
 
-///////////////////////////////////////////////////////////////////////////////
-
-// // RequestVote handles vote requests from candidates
-// func (s *Server) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) error {
-// 	s.mu.Lock()
-// 	defer s.mu.Unlock()
-
-// 	// Reject if the candidate's term is outdated
-// 	if args.Term < s.currentTerm {
-// 		reply.Term = s.currentTerm
-// 		reply.VoteGranted = false
-// 		return nil
-// 	}
-
-// 	// If the candidate has a newer term, update term and reset vote
-// 	if args.Term > s.currentTerm {
-// 		s.currentTerm = args.Term
-// 		s.votedFor = -1
-// 	}
-
-// 	// Check if we can grant the vote
-// 	if (s.votedFor == -1 || s.votedFor == args.CandidateID) &&
-// 		(args.LastLogTerm > s.getLastLogTerm() || (args.LastLogTerm == s.getLastLogTerm() && args.LastLogIndex >= s.getLastLogIndex())) {
-// 		s.votedFor = args.CandidateID
-// 		reply.VoteGranted = true
-// 	} else {
-// 		reply.VoteGranted = false
-// 	}
-
-// 	reply.Term = s.currentTerm
-// 	return nil
-// }
-
-// func (s *Server) getLastLogIndex() int {
-// 	panic("unimplemented")
-// }
-
-// func (s *Server) getLastLogTerm() int {
-// 	panic("unimplemented")
-// }
+	return nil
+}
 
 ///////////////////////////////////////////////////////////////////////////////
+
+func (s *Server) getLastLogAndLastTerm() (int, int) {
+	var lastLogIndex, lastLogTerm int
+	n := len(s.Logs.logs)
+	if n == 0 {
+		return -1, -1
+	}
+	lastLogIndex = n - 1
+	lastLogTerm = s.Logs.logs[n-1].Term
+	return lastLogIndex, lastLogTerm
+}
 
 // Get retrieves a value for a given key and logs the operation
 func (s *Server) Get(key string) ([]byte, error) {
